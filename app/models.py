@@ -338,3 +338,104 @@ class ChunkValidateResponse(BaseModel):
     continuation_token: str = Field(
         description="下一段请求需携带的续传令牌（不透明字符串，带签名）"
     )
+
+
+# ---------------------------------------------------------------------------
+# 交接计划符合性审计（/api/v1/seal-chain/handover-plan-audit）
+# ---------------------------------------------------------------------------
+
+
+class HandoverPlanNode(BaseModel):
+    """计划节点：某保管人应在半开交接窗口 [window_start, window_end) 内到任。
+
+    窗口为闭起点 / 开终点：window_start <= t < window_end 计为准时；
+    window_start 必须严格早于 window_end。
+    """
+
+    custodian: str = Field(min_length=1, description="计划到任保管人")
+    window_start: datetime = Field(description="计划窗口起点（含）")
+    window_end: datetime = Field(description="计划窗口终点（不含）")
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> "HandoverPlanNode":
+        try:
+            start_before_end = self.window_start < self.window_end
+        except TypeError:
+            raise ValueError("窗口起止时间的时区信息不一致（不能混用带时区与不带时区的时间）")
+        if not start_before_end:
+            raise ValueError("window_start 必须早于 window_end")
+        return self
+
+
+class HandoverPlanAuditRequest(BaseModel):
+    """交接计划符合性审计请求：事件序列与按顺序排列的计划节点。"""
+
+    events: List[Event] = Field(default_factory=list)
+    plan: List[HandoverPlanNode] = Field(
+        default_factory=list,
+        description="按计划顺序排列的到任节点；匹配必须保持该顺序且不交叉",
+    )
+
+
+class HandoverPlanNodeResult(BaseModel):
+    """单个计划节点的匹配结果。"""
+
+    index: int = Field(description="计划节点下标（从 0 开始，对应请求 plan 中的位置）")
+    custodian: str = Field(description="回显计划保管人")
+    window_start: datetime = Field(description="回显窗口起点")
+    window_end: datetime = Field(description="回显窗口终点")
+    status: str = Field(description="matched（已匹配实际记录）或 missing（无实际到任记录）")
+    event_index: Optional[int] = Field(
+        default=None,
+        description="匹配到的实际记录所在事件下标（从 0 开始，全链下标）；missing 时为 null",
+    )
+    actual_timestamp: Optional[datetime] = Field(
+        default=None, description="匹配事件的实际时间；missing 时为 null"
+    )
+    timing: Optional[str] = Field(
+        default=None,
+        description="实际到任相对窗口的状态：early（早于 window_start）/ "
+        "on_time（window_start <= t < window_end）/ late（不早于 window_end）；missing 时为 null",
+    )
+    deviation_seconds: Optional[float] = Field(
+        default=None,
+        description="实际时间偏离对应窗口的秒数：early 为 window_start - t，"
+        "late 为 t - window_end，on_time 为 0；missing 时为 null",
+    )
+
+
+class UnexpectedArrival(BaseModel):
+    """未被任何计划节点匹配的实际到任记录。"""
+
+    event_index: int = Field(description="该记录在事件链中的下标（从 0 开始）")
+    type: EventType = Field(description="来源事件类型：seal / reseal / handover")
+    timestamp: datetime = Field(description="实际到任时间")
+    custodian: str = Field(description="实际到任保管人")
+
+
+class HandoverPlanSummary(BaseModel):
+    """交接计划符合性审计汇总计数。"""
+
+    matched: int = Field(description="已匹配的计划节点数")
+    missing: int = Field(description="未匹配的计划节点数")
+    unexpected: int = Field(description="未匹配的实际到任记录数")
+    early: int = Field(description="已匹配记录中早到（early）的数量")
+    on_time: int = Field(description="已匹配记录中准时（on_time）的数量")
+    late: int = Field(description="已匹配记录中迟到（late）的数量")
+
+
+class HandoverPlanAuditResponse(BaseModel):
+    """交接计划符合性审计响应：保留原单链校验结果，另附全局最优匹配明细。"""
+
+    validation: ValidateResponse = Field(
+        description="现有单链校验器的原始结果；仅以其中 status=ok 的 seal/reseal/handover "
+        "提取实际到任记录"
+    )
+    plan_results: List[HandoverPlanNodeResult] = Field(
+        description="每个计划节点的匹配结果，按请求 plan 顺序"
+    )
+    unexpected: List[UnexpectedArrival] = Field(
+        default_factory=list,
+        description="未匹配任何计划节点的实际到任记录，按事件下标升序",
+    )
+    summary: HandoverPlanSummary = Field(description="各状态数量汇总")

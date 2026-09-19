@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from .batch import validate_batch
 from .chunk import ChunkValidateError, validate_chunk
 from .exposure import ExposureAuditError, audit_exposure
+from .handover import HandoverPlanAuditError, audit_handover_plan
 from .models import (
     BatchValidateRequest,
     BatchValidateResponse,
@@ -13,6 +14,8 @@ from .models import (
     ChunkValidateResponse,
     ExposureAuditRequest,
     ExposureAuditResponse,
+    HandoverPlanAuditRequest,
+    HandoverPlanAuditResponse,
     ReconcileRequest,
     ReconcileResponse,
     ValidateRequest,
@@ -24,7 +27,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -102,4 +105,23 @@ def chunk_validate(request: ChunkValidateRequest) -> ChunkValidateResponse:
     try:
         return validate_chunk(request)
     except ChunkValidateError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/handover-plan-audit",
+    response_model=HandoverPlanAuditResponse,
+    tags=["seal-chain"],
+    summary="交接计划符合性审计：实际到任记录与计划窗口的全局最优匹配",
+)
+def handover_plan_audit(request: HandoverPlanAuditRequest) -> HandoverPlanAuditResponse:
+    """保留原单链校验结果；仅从 status=ok 的 seal/reseal/handover 提取实际到任
+    记录（保留全链事件下标），按保管人相同且顺序不交叉做一对一全局最优匹配：
+    先最大化匹配数，再最小化实际时间偏离对应窗口的总秒数，仍并列时取事件下标
+    序列字典序最小的方案（动态规划，不做逐项贪心）。返回每个计划节点的
+    matched/missing、匹配事件下标及 early/on_time/late，未匹配实际记录列为
+    unexpected，并汇总各状态数量。窗口起止时间混用带时区与不带时区时间时返回 422。"""
+    try:
+        return audit_handover_plan(request)
+    except HandoverPlanAuditError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

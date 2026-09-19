@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
 
 ## 校验规则（状态机）
 
@@ -387,6 +387,111 @@ curl -s http://localhost:8000/api/v1/seal-chain/exposure-audit \
 # start 晚于 end，返回 422
 ```
 
+### `POST /api/v1/seal-chain/handover-plan-audit`
+
+交接计划符合性审计。在单链状态机校验的基础上，回答“**实际到任记录与按序计划的保管人交接窗口是否吻合**”。处理分三步：
+
+1. **调用现有单链校验器**，响应中原样保留 `validation`（结构同 `/validate`）；
+2. **提取实际到任记录**：仅从 `validation.events` 中 `status = ok` 的 **seal / reseal / handover** 事件提取（到任保管人即该事件发生后的在任保管人），并保留其在**全链事件中的下标**；unseal 不是到任记录，违规事件（包括状态机层面不合法的 seal/reseal/handover）一律不参与匹配；
+3. **全局最优匹配**：计划节点与实际记录做一对一匹配，要求**保管人相同且按顺序不交叉**（保序）。采用序列对齐式动态规划求全局最优（**不做逐项贪心**），目标依次为：
+   1. **最大化匹配数**；
+   2. 匹配数相同时，**最小化实际时间偏离对应窗口的总秒数**（`early: window_start - t`；`late: t - window_end`；`on_time: 0`）；
+   3. 仍并列时，取**匹配事件下标序列字典序最小**的方案（按计划节点顺序排列的事件下标元组）。
+
+窗口为**闭起点 / 开终点**：`window_start <= t < window_end` 计为 `on_time`，早于 `window_start` 为 `early`，不早于 `window_end` 为 `late`。未匹配的计划节点为 `missing`，未匹配的实际记录列入 `unexpected`。链本身存在状态机违规**不影响**审计接口返回 `200`，违规情况只体现在 `validation` 中；窗口起止时间混用带时区与不带时区的时间、或 `window_start >= window_end` 时返回 `422`。
+
+**请求体**
+
+```json
+{
+  "events": [
+    {"type": "seal",     "timestamp": "2026-09-19T09:50:00Z", "seal_id": "S001", "custodian": "Alice"},
+    {"type": "handover", "timestamp": "2026-09-19T11:00:00Z", "custodian": "Bob"},
+    {"type": "unseal",   "timestamp": "2026-09-19T11:30:00Z"},
+    {"type": "reseal",   "timestamp": "2026-09-19T11:45:00Z", "seal_id": "S002", "custodian": "Bob"}
+  ],
+  "plan": [
+    {"custodian": "Alice", "window_start": "2026-09-19T10:00:00Z", "window_end": "2026-09-19T11:00:00Z"},
+    {"custodian": "Bob",   "window_start": "2026-09-19T11:00:00Z", "window_end": "2026-09-19T12:00:00Z"}
+  ]
+}
+```
+
+- `plan[]`：按计划顺序排列的节点，每个节点含 `custodian`、`window_start`、`window_end`（窗口半开，起点必须严格早于终点）；允许空列表。
+
+**响应示例**（对应上例：Alice 早到 10 分钟，Bob 准时；合法 reseal 后在任保管人仍为 Bob，无后续 Bob 节点，故下标 3 为 unexpected；unseal 不计入到任记录）
+
+```json
+{
+  "validation": {
+    "valid": true,
+    "sealed": true,
+    "final_custodian": "Bob",
+    "current_seal": "S002",
+    "events": [
+      {"index": 0, "type": "seal",     "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 2, "type": "unseal",   "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 3, "type": "reseal",   "status": "ok", "reason": null, "cross_chain_conflict": false}
+    ],
+    "violations": []
+  },
+  "plan_results": [
+    {
+      "index": 0, "custodian": "Alice",
+      "window_start": "2026-09-19T10:00:00Z", "window_end": "2026-09-19T11:00:00Z",
+      "status": "matched", "event_index": 0,
+      "actual_timestamp": "2026-09-19T09:50:00Z",
+      "timing": "early", "deviation_seconds": 600.0
+    },
+    {
+      "index": 1, "custodian": "Bob",
+      "window_start": "2026-09-19T11:00:00Z", "window_end": "2026-09-19T12:00:00Z",
+      "status": "matched", "event_index": 1,
+      "actual_timestamp": "2026-09-19T11:00:00Z",
+      "timing": "on_time", "deviation_seconds": 0.0
+    }
+  ],
+  "unexpected": [
+    {"event_index": 3, "type": "reseal",
+     "timestamp": "2026-09-19T11:45:00Z", "custodian": "Bob"}
+  ],
+  "summary": {"matched": 2, "missing": 0, "unexpected": 1,
+              "early": 1, "on_time": 1, "late": 0}
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `validation` | 现有单链校验器的原始结果（结构同 `/validate`），审计仅采用其中 `status=ok` 的 seal/reseal/handover |
+| `plan_results[]` | 每个计划节点的结果，按请求 `plan` 顺序；含回显的 `custodian` / `window_start` / `window_end` |
+| `plan_results[].status` | `matched`（已匹配实际记录）或 `missing`（无实际到任记录） |
+| `plan_results[].event_index` | 匹配事件在**全链事件**中的下标（从 0 开始，含违规事件位置）；`missing` 时为 `null` |
+| `plan_results[].timing` | `early` / `on_time` / `late`；`missing` 时为 `null` |
+| `plan_results[].deviation_seconds` | 实际时间偏离窗口的秒数（早到取距起点、迟到取距终点，准时为 0）；`missing` 时为 `null` |
+| `unexpected[]` | 未匹配任何计划节点的实际到任记录，按事件下标升序；含 `event_index` / `type` / `timestamp` / `custodian` |
+| `summary` | `matched` / `missing` / `unexpected` 数量，以及已匹配记录中 `early` / `on_time` / `late` 的数量 |
+
+### 交接计划符合性审计接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/handover-plan-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"events": [
+          {"type": "seal", "timestamp": "2026-09-19T10:00:00Z",
+           "seal_id": "S001", "custodian": "Alice"},
+          {"type": "handover", "timestamp": "2026-09-19T11:30:00Z",
+           "custodian": "Bob"}
+        ],
+        "plan": [
+          {"custodian": "Alice", "window_start": "2026-09-19T10:00:00Z",
+           "window_end": "2026-09-19T11:00:00Z"},
+          {"custodian": "Bob", "window_start": "2026-09-19T11:00:00Z",
+           "window_end": "2026-09-19T12:00:00Z"}
+        ]}'
+# Alice 准时、Bob 迟到 1800 秒：matched=2, late=1
+```
+
 ### `POST /api/v1/seal-chain/validate-chunk`
 
 分段校验超长事件链。把一条长链拆成若干段依次提交：**首段不带 `continuation_token`**，响应返回不透明的**续传令牌**；后续段携带上一响应返回的令牌，即可从上一段结束时的状态机状态继续校验。**逐事件判定与把所有分段拼接后调用 `/api/v1/seal-chain/validate` 完全一致**，响应中的 `index` 为全链偏移（从 0 开始）。
@@ -511,17 +616,19 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计与分段校验）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计与分段校验）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
   exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
+  handover.py    # 交接计划符合性审计（实际到任提取 / 全局最优匹配动态规划）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
 tests/
   test_validator.py
   test_batch.py
   test_reconcile.py
   test_exposure.py
+  test_handover.py
   test_chunk.py
 Dockerfile
 docker-compose.yml
